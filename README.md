@@ -29,6 +29,41 @@ Refresh a Spotify playlist with a fresh random sample from your Liked Songs.
 
 The script stores the playlist id in `~/.local/state/spotify-true-shuffle/playlist_id` so later runs keep updating the same playlist.
 
+By default `install.sh` also writes and enables a `systemd --user` timer for a daily 07:00 run.
+
+## Create a Spotify app
+
+1. Go to the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and sign in.
+2. Click `Create an app`.
+3. Give it any name and description.
+4. Add a redirect URI such as `http://127.0.0.1:3000/callback`.
+5. Open the app settings and copy the `Client ID`.
+6. Click `View client secret` and copy the `Client Secret`.
+
+Put that same redirect URI into `SPOTIFY_REDIRECT_URI` in `~/.config/spotify-true-shuffle/config.env`.
+
+For this script, the app needs a user refresh token created via Spotify's Authorization Code flow, with these scopes:
+
+- `user-library-read`
+- `playlist-modify-private`
+
+Spotify docs:
+
+- [Getting started](https://developer.spotify.com/documentation/web-api/tutorials/getting-started)
+- [Authorization Code flow](https://developer.spotify.com/documentation/web-api/tutorials/code-flow)
+- [Refreshing tokens](https://developer.spotify.com/documentation/web-api/tutorials/refreshing-tokens)
+
+## Get a refresh token
+
+If `SPOTIFY_REFRESH_TOKEN` is missing, `./install.sh` can do most of the OAuth setup for you:
+
+1. Fill in `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and `SPOTIFY_REDIRECT_URI` in `~/.config/spotify-true-shuffle/config.env`.
+2. Run `./install.sh` in a terminal.
+3. The installer opens Spotify's authorisation page.
+4. After you approve access, the installer runs a tiny local web server on the redirect URI, captures the authorisation code, exchanges it for tokens, and writes `SPOTIFY_REFRESH_TOKEN` into your config file.
+
+Once you have the refresh token, the script handles access-token refresh automatically on later runs.
+
 ## Optional config
 
 - `SPOTIFY_PLAYLIST_NAME`
@@ -39,7 +74,25 @@ The script stores the playlist id in `~/.local/state/spotify-true-shuffle/playli
 
 ## Scheduling
 
-Example `systemd --user` service:
+The installer writes these files:
+
+- `~/.config/systemd/user/spotify-true-shuffle.service`
+- `~/.config/systemd/user/spotify-true-shuffle.timer`
+
+It then runs:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now spotify-true-shuffle.timer
+```
+
+To skip `systemd` setup:
+
+```bash
+INSTALL_SYSTEMD=0 ./install.sh
+```
+
+Installed service:
 
 ```ini
 [Unit]
@@ -47,7 +100,22 @@ Description=Refresh Spotify true shuffle playlist
 
 [Service]
 Type=oneshot
-ExecStart=/path/to/spotify_true_shuffle
+ExecStart=%h/.local/bin/spotify_true_shuffle
+```
+
+Installed timer:
+
+```ini
+[Unit]
+Description=Run Spotify true shuffle daily
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+Unit=spotify-true-shuffle.service
+
+[Install]
+WantedBy=timers.target
 ```
 
 Run it from a timer, cron job, or manually.
