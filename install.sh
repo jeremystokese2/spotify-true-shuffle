@@ -13,10 +13,25 @@ INSTALL_SYSTEMD="${INSTALL_SYSTEMD:-1}"
 INSTALL_FETCH_REFRESH_TOKEN="${INSTALL_FETCH_REFRESH_TOKEN:-1}"
 SERVICE_FILE="${SYSTEMD_DIR}/spotify-true-shuffle.service"
 TIMER_FILE="${SYSTEMD_DIR}/spotify-true-shuffle.timer"
+DEFAULT_REDIRECT_URI="http://127.0.0.1:3000/callback"
+
+print_banner() {
+  printf '\n'
+  printf '  ____             _   _  __       ____  _            __  __ _      _ _ _\n'
+  printf ' / ___| _ __   ___ | |_(_)/ _|_   _/ ___|| |__  _   _ / _|/ _| | ___| | | |\n'
+  printf ' \___ \|  _ \\ / _ \\| __| | |_| | | \\___ \\|  _ \\| | | | |_| |_| |/ _ \\ | | |\n'
+  printf '  ___) | |_) | (_) | |_| |  _| |_| |___) | | | | |_| |  _|  _| |  __/_|_|_|\n'
+  printf ' |____/| .__/ \\___/ \\__|_|_|  \\__, |____/|_| |_|\\__,_|_| |_| |_|\\___(_|_|_)\n'
+  printf '       |_|                     |___/\n'
+}
 
 is_placeholder() {
   local value="$1"
   [[ -z "$value" || "$value" == your_* ]]
+}
+
+shell_quote() {
+  printf '%q' "$1"
 }
 
 upsert_config() {
@@ -35,8 +50,44 @@ upsert_config() {
   mv "$tmp_file" "$CONFIG_FILE"
 }
 
+config_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1) }' "$CONFIG_FILE" | tail -n 1
+}
+
+maybe_run_initial_refresh() {
+  local client_id client_secret refresh_token run_output playlist_id liked_tracks used_tracks
+
+  client_id="$(config_value SPOTIFY_CLIENT_ID)"
+  client_secret="$(config_value SPOTIFY_CLIENT_SECRET)"
+  refresh_token="$(config_value SPOTIFY_REFRESH_TOKEN)"
+
+  if is_placeholder "$client_id" || is_placeholder "$client_secret" || is_placeholder "$refresh_token"; then
+    printf 'Spotify setup saved, but the initial playlist refresh was skipped because the credentials are incomplete.\n'
+    return
+  fi
+
+  printf 'Running the first playlist refresh...\n'
+  if ! run_output="$($TARGET_LINK 2>&1)"; then
+    printf 'The installer finished, but the first playlist refresh failed:\n%s\n' "$run_output" >&2
+    return 1
+  fi
+
+  playlist_id="$(printf '%s\n' "$run_output" | awk -F': ' '/^Playlist ID:/ { print $2 }')"
+  liked_tracks="$(printf '%s\n' "$run_output" | awk -F': ' '/^Liked tracks found:/ { print $2 }')"
+  used_tracks="$(printf '%s\n' "$run_output" | awk -F': ' '/^Tracks placed into playlist:/ { print $2 }')"
+
+  printf 'Initial playlist refresh complete.\n'
+  if [[ -n "$playlist_id" ]]; then
+    printf 'Playlist ID: %s\n' "$playlist_id"
+  fi
+  if [[ -n "$liked_tracks" && -n "$used_tracks" ]]; then
+    printf 'Picked %s tracks from %s liked songs.\n' "$used_tracks" "$liked_tracks"
+  fi
+}
+
 maybe_fetch_refresh_token() {
-  local client_id client_secret refresh_token redirect_uri auth_url auth_code token_response new_refresh_token
+  local client_id client_secret refresh_token redirect_uri auth_url auth_code token_response new_refresh_token code_file server_pid
 
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
@@ -44,7 +95,7 @@ maybe_fetch_refresh_token() {
   client_id="${SPOTIFY_CLIENT_ID:-}"
   client_secret="${SPOTIFY_CLIENT_SECRET:-}"
   refresh_token="${SPOTIFY_REFRESH_TOKEN:-}"
-  redirect_uri="${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:3000/callback}"
+  redirect_uri="${SPOTIFY_REDIRECT_URI:-$DEFAULT_REDIRECT_URI}"
 
   if [[ "$INSTALL_FETCH_REFRESH_TOKEN" != "1" ]]; then
     printf 'Skipping refresh token setup because INSTALL_FETCH_REFRESH_TOKEN=%s\n' "$INSTALL_FETCH_REFRESH_TOKEN"
@@ -53,11 +104,6 @@ maybe_fetch_refresh_token() {
 
   if ! is_placeholder "$refresh_token"; then
     printf 'Keeping existing Spotify refresh token\n'
-    return
-  fi
-
-  if is_placeholder "$client_id" || is_placeholder "$client_secret"; then
-    printf 'Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in %s first\n' "$CONFIG_FILE"
     return
   fi
 
@@ -70,6 +116,38 @@ maybe_fetch_refresh_token() {
     printf 'Refresh token setup requires python3, curl, jq, and base64\n' >&2
     return
   fi
+
+  if is_placeholder "$client_id"; then
+    printf 'Spotify Client ID: '
+    IFS= read -r client_id
+    if is_placeholder "$client_id"; then
+      printf 'Client ID is required\n' >&2
+      return
+    fi
+    upsert_config SPOTIFY_CLIENT_ID "$(shell_quote "$client_id")"
+  fi
+
+  if is_placeholder "$client_secret"; then
+    printf 'Spotify Client Secret: '
+    stty -echo
+    IFS= read -r client_secret
+    stty echo
+    printf '\n'
+    if is_placeholder "$client_secret"; then
+      printf 'Client secret is required\n' >&2
+      return
+    fi
+    upsert_config SPOTIFY_CLIENT_SECRET "$(shell_quote "$client_secret")"
+  fi
+
+  if [[ "$redirect_uri" != "$DEFAULT_REDIRECT_URI" ]]; then
+    printf 'Using configured redirect URI: %s\n' "$redirect_uri"
+  else
+    printf 'Using redirect URI: %s\n' "$redirect_uri"
+  fi
+  printf 'Make sure this exact callback URL is registered in your Spotify app before you continue.\n'
+  printf 'Press Enter to continue... '
+  IFS= read -r _
 
   auth_url="$(python3 - "$client_id" "$redirect_uri" <<'PY'
 import sys
@@ -85,21 +163,21 @@ params = {
 }
 print('https://accounts.spotify.com/authorize?' + urlencode(params))
 PY
-)"
+  )"
 
   printf 'Open this URL, approve access, and wait for the local callback:\n%s\n' "$auth_url"
-  if command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$auth_url" >/dev/null 2>&1 || true
-  elif command -v open >/dev/null 2>&1; then
-    open "$auth_url" >/dev/null 2>&1 || true
-  fi
 
-  auth_code="$(python3 - "$redirect_uri" <<'PY'
+  code_file="$(mktemp)"
+  trap 'rm -f "$code_file"' RETURN
+
+  printf 'Waiting for Spotify callback on %s\n' "$redirect_uri"
+  python3 - "$redirect_uri" "$code_file" <<'PY' >/dev/null &
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 redirect_uri = sys.argv[1]
+code_file = sys.argv[2]
 parsed = urlparse(redirect_uri)
 host = parsed.hostname or '127.0.0.1'
 port = parsed.port or 80
@@ -115,25 +193,47 @@ class Handler(BaseHTTPRequestHandler):
 
         query = parse_qs(parsed_request.query)
         code = query.get('code', [''])[0]
+        error = query.get('error', [''])[0]
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.end_headers()
         if code:
             self.wfile.write(b'<html><body><h1>Spotify authorisation complete</h1><p>You can close this window.</p></body></html>')
-            print(code)
+            with open(code_file, 'w', encoding='utf-8') as handle:
+                handle.write(code)
         else:
             self.wfile.write(b'<html><body><h1>Spotify authorisation failed</h1><p>No code received.</p></body></html>')
-        self.server.code = code
+            if error:
+                with open(code_file, 'w', encoding='utf-8') as handle:
+                    handle.write('ERROR:' + error)
 
     def log_message(self, format, *args):
         return
 
 server = HTTPServer((host, port), Handler)
 server.handle_request()
-if not getattr(server, 'code', ''):
-    raise SystemExit(1)
 PY
-)"
+  server_pid=$!
+
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$auth_url" >/dev/null 2>&1 || true
+  elif command -v open >/dev/null 2>&1; then
+    open "$auth_url" >/dev/null 2>&1 || true
+  fi
+
+  while [[ ! -s "$code_file" ]]; do
+    sleep 1
+  done
+
+  wait "$server_pid"
+  auth_code="$(<"$code_file")"
+  rm -f "$code_file"
+  trap - RETURN
+
+  if [[ "$auth_code" == ERROR:* ]]; then
+    printf 'Spotify authorisation failed: %s\n' "${auth_code#ERROR:}" >&2
+    return
+  fi
 
   token_response="$(curl -fsS -X POST "https://accounts.spotify.com/api/token" \
     -H "Authorization: Basic $(printf '%s' "${client_id}:${client_secret}" | base64 | tr -d '\n')" \
@@ -157,12 +257,12 @@ ln -sfn "${REPO_DIR}/spotify_true_shuffle" "$TARGET_LINK"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   cp "$EXAMPLE_FILE" "$CONFIG_FILE"
-  printf 'Created %s\n' "$CONFIG_FILE"
+  printf 'Created local config at %s\n' "$CONFIG_FILE"
 else
-  printf 'Keeping existing %s\n' "$CONFIG_FILE"
+  printf 'Using existing config at %s\n' "$CONFIG_FILE"
 fi
 
-printf 'Linked %s -> %s\n' "$TARGET_LINK" "${REPO_DIR}/spotify_true_shuffle"
+printf 'Linked %s\n' "$TARGET_LINK"
 
 maybe_fetch_refresh_token
 
@@ -191,12 +291,11 @@ Unit=spotify-true-shuffle.service
 WantedBy=timers.target
 EOF
 
-  printf 'Wrote %s\n' "$SERVICE_FILE"
-  printf 'Wrote %s\n' "$TIMER_FILE"
+  printf 'Installed user service and timer.\n'
 
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl --user daemon-reload && systemctl --user enable --now spotify-true-shuffle.timer; then
-      printf 'Enabled spotify-true-shuffle.timer\n'
+      printf 'Enabled daily timer at 07:00.\n'
     else
       printf 'systemctl --user is available but enable/start failed; configure %s manually if needed\n' "$TIMER_FILE"
     fi
@@ -207,4 +306,6 @@ else
   printf 'Skipping systemd setup because INSTALL_SYSTEMD=%s\n' "$INSTALL_SYSTEMD"
 fi
 
-printf 'Next: edit %s and then run spotify_true_shuffle\n' "$CONFIG_FILE"
+maybe_run_initial_refresh
+print_banner
+printf 'spotify_true_shuffle is installed and ready.\n'

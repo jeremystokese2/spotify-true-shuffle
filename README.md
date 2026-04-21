@@ -15,16 +15,13 @@ Refresh a Spotify playlist with a fresh random sample from your Liked Songs.
 - `curl`
 - `jq`
 - `shuf`
-- a Spotify app with a refresh token for your account
+- a Spotify app for your account
 
 ## Setup
 
 1. Clone the repo.
 2. Run `./install.sh`.
-3. Fill in `~/.config/spotify-true-shuffle/config.env`:
-   - `SPOTIFY_CLIENT_ID`
-   - `SPOTIFY_CLIENT_SECRET`
-   - `SPOTIFY_REFRESH_TOKEN`
+3. If prompted, enter your Spotify `Client ID` and `Client Secret`.
 4. Run `spotify_true_shuffle`.
 
 The script stores the playlist id in `~/.local/state/spotify-true-shuffle/playlist_id` so later runs keep updating the same playlist.
@@ -40,7 +37,7 @@ By default `install.sh` also writes and enables a `systemd --user` timer for a d
 5. Open the app settings and copy the `Client ID`.
 6. Click `View client secret` and copy the `Client Secret`.
 
-Put that same redirect URI into `SPOTIFY_REDIRECT_URI` in `~/.config/spotify-true-shuffle/config.env`.
+The installer assumes that exact callback URL is already registered in the Spotify app.
 
 For this script, the app needs a user refresh token created via Spotify's Authorization Code flow, with these scopes:
 
@@ -55,12 +52,15 @@ Spotify docs:
 
 ## Get a refresh token
 
-If `SPOTIFY_REFRESH_TOKEN` is missing, `./install.sh` can do most of the OAuth setup for you:
+If `SPOTIFY_REFRESH_TOKEN` is missing, `./install.sh` can do the OAuth setup for you:
 
-1. Fill in `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and `SPOTIFY_REDIRECT_URI` in `~/.config/spotify-true-shuffle/config.env`.
-2. Run `./install.sh` in a terminal.
-3. The installer opens Spotify's authorisation page.
-4. After you approve access, the installer runs a tiny local web server on the redirect URI, captures the authorisation code, exchanges it for tokens, and writes `SPOTIFY_REFRESH_TOKEN` into your config file.
+1. Run `./install.sh` in a terminal.
+2. If the config does not already contain them, the installer prompts for `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` and saves them.
+3. The installer assumes the Spotify app already allows `http://127.0.0.1:3000/callback`.
+4. The installer starts a tiny local callback server, prints the Spotify authorisation URL, and opens it in your browser when possible.
+5. After you approve access, the installer captures the authorisation code, exchanges it for tokens, and writes `SPOTIFY_REFRESH_TOKEN` into your config file.
+
+You can also prefill `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, or `SPOTIFY_REDIRECT_URI` in `~/.config/spotify-true-shuffle/config.env` if you prefer.
 
 Once you have the refresh token, the script handles access-token refresh automatically on later runs.
 
