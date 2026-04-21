@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/spotify-true-shuffle"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/spotify-true-shuffle"
+ENV_FILE="${SPOTIFY_TRUE_SHUFFLE_ENV_FILE:-$CONFIG_DIR/config.env}"
+PLAYLIST_ID_FILE="${SPOTIFY_TRUE_SHUFFLE_PLAYLIST_ID_FILE:-$STATE_DIR/playlist_id}"
+
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+: "${SPOTIFY_CLIENT_ID:?Missing SPOTIFY_CLIENT_ID in $ENV_FILE}"
+: "${SPOTIFY_CLIENT_SECRET:?Missing SPOTIFY_CLIENT_SECRET in $ENV_FILE}"
+: "${SPOTIFY_REFRESH_TOKEN:?Missing SPOTIFY_REFRESH_TOKEN in $ENV_FILE}"
+
+PLAYLIST_NAME="${SPOTIFY_PLAYLIST_NAME:-Daily True Shuffle}"
+PLAYLIST_DESCRIPTION="${SPOTIFY_PLAYLIST_DESCRIPTION:-100 random tracks from Liked Songs. Regenerated daily.}"
+TRACK_COUNT="${SPOTIFY_TRACK_COUNT:-100}"
+
+for cmd in curl jq shuf base64 awk wc mkdir mv; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    printf 'Missing dependency: %s\n' "$cmd" >&2
+    exit 1
+  }
+done
+
+mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+
+ALL_TRACKS_FILE="$(mktemp)"
+SELECTED_TRACKS_FILE="$(mktemp)"
+trap 'rm -f "$ALL_TRACKS_FILE" "$SELECTED_TRACKS_FILE"' EXIT
+
+b64_auth() {
+  printf '%s' "${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}" | base64 | tr -d '\n'
+}
+
+get_access_token() {
+  curl -fsS -X POST "https://accounts.spotify.com/api/token" \
+    -H "Authorization: Basic $(b64_auth)" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "grant_type=refresh_token" \
+    --data-urlencode "refresh_token=${SPOTIFY_REFRESH_TOKEN}" \
+  | jq -r '.access_token'
+}
+
+spotify_get() {
+  local token="$1"
+  local url="$2"
+  curl -fsS "$url" -H "Authorization: Bearer ${token}"
+}
+
+spotify_post_json() {
+  local token="$1"
+  local url="$2"
+  local json="$3"
+  curl -fsS -X POST "$url" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "$json"
+}
+
+spotify_put_json() {
+  local token="$1"
+  local url="$2"
+  local json="$3"
+  curl -fsS -X PUT "$url" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "$json"
+}
+
+fetch_all_liked_track_uris() {
+  local token="$1"
+  local offset=0
+  : > "$ALL_TRACKS_FILE"
+
+  while true; do
+    local page
+    page="$(spotify_get "$token" "https://api.spotify.com/v1/me/tracks?limit=50&offset=${offset}")"
+    jq -r '.items[] | .track.uri // empty' <<<"$page" >> "$ALL_TRACKS_FILE"
+
+    local next
+    next="$(jq -r '.next' <<<"$page")"
+    if [[ "$next" == "null" ]]; then
+      break
+    fi
+
+    offset=$((offset + 50))
+  done
+
+  awk 'NF && !seen[$0]++' "$ALL_TRACKS_FILE" > "${ALL_TRACKS_FILE}.dedup"
+  mv "${ALL_TRACKS_FILE}.dedup" "$ALL_TRACKS_FILE"
+}
+
+ensure_playlist_exists() {
+  local token="$1"
+
+  if [[ -s "$PLAYLIST_ID_FILE" ]]; then
+    printf '%s\n' "$(<"$PLAYLIST_ID_FILE")"
+    return
+  fi
+
+  local payload
+  payload="$(jq -n --arg name "$PLAYLIST_NAME" --arg desc "$PLAYLIST_DESCRIPTION" '{name: $name, public: false, description: $desc}')"
+
+  local response
+  response="$(spotify_post_json "$token" "https://api.spotify.com/v1/me/playlists" "$payload")"
+
+  local playlist_id
+  playlist_id="$(jq -r '.id' <<<"$response")"
+  if [[ -z "$playlist_id" || "$playlist_id" == "null" ]]; then
+    printf 'Failed to create playlist\n' >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$playlist_id" > "$PLAYLIST_ID_FILE"
+  printf '%s\n' "$playlist_id"
+}
+
+pick_random_tracks() {
+  local total
+  total="$(wc -l < "$ALL_TRACKS_FILE" | tr -d ' ')"
+  if [[ "$total" -eq 0 ]]; then
+    printf 'No liked tracks found.\n' >&2
+    exit 1
+  fi
+
+  local count="$TRACK_COUNT"
+  if [[ "$total" -lt "$TRACK_COUNT" ]]; then
+    count="$total"
+  fi
+
+  shuf -n "$count" "$ALL_TRACKS_FILE" > "$SELECTED_TRACKS_FILE"
+}
+
+replace_playlist_contents() {
+  local token="$1"
+  local playlist_id="$2"
+  local payload
+  payload="$(jq -Rn '[inputs | select(length > 0)] | {uris: .}' < "$SELECTED_TRACKS_FILE")"
+  spotify_put_json "$token" "https://api.spotify.com/v1/playlists/${playlist_id}/items" "$payload" >/dev/null
+}
+
+ACCESS_TOKEN="$(get_access_token)"
+PLAYLIST_ID="$(ensure_playlist_exists "$ACCESS_TOKEN")"
+fetch_all_liked_track_uris "$ACCESS_TOKEN"
+pick_random_tracks
+replace_playlist_contents "$ACCESS_TOKEN" "$PLAYLIST_ID"
+
+TOTAL_TRACKS="$(wc -l < "$ALL_TRACKS_FILE" | tr -d ' ')"
+USED_TRACKS="$(wc -l < "$SELECTED_TRACKS_FILE" | tr -d ' ')"
+
+printf 'Done.\n'
+printf 'Playlist ID: %s\n' "$PLAYLIST_ID"
+printf 'Liked tracks found: %s\n' "$TOTAL_TRACKS"
+printf 'Tracks placed into playlist: %s\n' "$USED_TRACKS"
